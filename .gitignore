@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.env
+.env.*
+*.pyc
+*.log
+secrets/
+my-securo-plugin-index/
+site/
