@@ -30,6 +30,14 @@ The plugin must first be published to the catalog used by your Securo instance b
 
 To show pending transactions, enable **Import pending transactions** in Securo's connection settings. The plugin marks the separately returned pending entries as pending; Securo decides whether to import them. Transaction data may change when an entry is booked, so verify that pending entries are matched or cleared and watch for duplicates. Pending amounts may already be reflected in the selected balance; do not subtract them again without checking.
 
+### Known limitation: pending transactions and balances
+
+Pending transactions do not always transition to booked in Securo. ING can report a different date or description after booking, and the pending entry may remain alongside the booked entry even after ING stops returning it. Transactions with the same amount can be separate purchases; do not merge them based on amount alone. Disabling **Import pending transactions** prevents importing new pending entries, but may not remove entries already imported.
+
+As a temporary workaround, disable **Import pending transactions** and use balance mode `booked` for a balance consistent with booked transactions. Alternatively, `pending` may show a balance that already reflects pending amounts, but those amounts will not be visible in the transaction list when pending imports are disabled. Actual balance semantics depend on ING's response; compare with ING before relying on either mode.
+
+**To do:** Investigate whether ING provides a stable, unique reference across pending and booked FinTS records, compare a pending record with its later booked form without collecting credentials or full bank responses, and verify Securo's update behavior. Only implement automatic matching when it is unambiguous, with tests covering repeated amounts, changed dates and descriptions, missing references, and duplicate references. Document any cases requiring manual review. See [issue #1](https://github.com/jschaufuss/securo-ing-fints/issues/1).
+
 ## Limitations and privacy
 
 - ING supports Direct Depot data via FinTS. Depot discovery and an empty depot response have been tested, but importing live holdings is **experimental and not yet verified with actual positions**. The plugin reads complete MT535 positions and leaves existing holdings unchanged when a depot reports no positions; missing or incomplete data stops the sync rather than deleting assets. Compare imported positions and valuations with ING.
