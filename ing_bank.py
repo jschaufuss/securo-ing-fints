@@ -228,23 +228,29 @@ def _parse_depot_statement(body, account, salt):
     return results
 
 
-def _holdings_rows(bank, entries, metadata, salt):
-    """Read every discovered depot completely; never archive on an uncertain response."""
+def _holdings_rows(bank, entries, metadata, salt, selected=frozenset()):
+    """Read every discovered depot completely; never archive on an uncertain response.
+
+    When the account selection names depots, only those are read; otherwise every
+    depot ING lists. A depot without positions adds none, but does not discard
+    the positions read from another depot. Only when no depot has any position is
+    None returned, which leaves Securo's holdings unchanged.
+    """
+    def iban(account):
+        return _text(getattr(account, 'iban', '')).replace(' ', '').upper()
     candidates = [a for a in entries if _account_type(_text(metadata.get(
-        _text(getattr(a, 'iban', '')).replace(' ', '').upper(), {}).get('product_name'))) == 'investment']
+        iban(a), {}).get('product_name'))) == 'investment']
+    if any(iban(a) in selected for a in candidates):
+        candidates = [a for a in candidates if iban(a) in selected]
     if not candidates:
         return None
     results = []
     for account in candidates:
         segments = _require_result(bank.get_depot_statements(account), stage='depot holdings')
-        if not segments:
-            return None
-        rows = []
-        for segment in segments:
-            rows.extend(_parse_depot_statement(getattr(segment, 'holdings', None), account, salt))
-        if not rows:
-            return None
-        results.extend(rows)
+        for segment in segments or []:
+            results.extend(_parse_depot_statement(getattr(segment, 'holdings', None), account, salt))
+    if not results:
+        return None
     if len(results) > 5000 or len({row['external_id'] for row in results}) != len(results):
         raise BankSyncError('ING depot positions are duplicated or exceed Securo limits')
     return results
@@ -333,6 +339,7 @@ def _sync(params, context, *, factory=None, today=None) -> dict:
                 raise BankSyncError('ING returned no SEPA accounts; existing accounts are unchanged')
             all_accounts = list(listed)
             selection = str(context.secrets.get('account_ibans') or '').strip()
+            selected = frozenset()
             if selection:
                 selected = {''.join(part.split()).upper() for part in selection.replace(';', ',').split(',')}
                 if any(not iban or not iban.isascii() or not iban.isalnum() or not 15 <= len(iban) <= 34 for iban in selected):
@@ -384,7 +391,7 @@ def _sync(params, context, *, factory=None, today=None) -> dict:
                 raise BankSyncError('ING result exceeds Securo batch limits; reduce history_days')
             # Opt-in. Never archive all assets on a transient unsupported FinTS response.
             include_holdings = str(context.config.get('holdings_enabled', '')).strip().lower() in ('yes', 'true', '1')
-            holdings = _holdings_rows(bank, all_accounts, metadata, salt) if include_holdings else None
+            holdings = _holdings_rows(bank, all_accounts, metadata, salt, selected) if include_holdings else None
         # Avoid persisting PIN in log files: serialized client state goes to encrypted Securo plugin vault.
         try:
             client_data = base64.b64encode(client.deconstruct()).decode('ascii')

@@ -217,6 +217,45 @@ class TestPlugin(unittest.TestCase):
                          ('Example fund', '2.500000', '123.45', 'EUR'))
         self.assertTrue(holding['account_external_id'].startswith('depot-'))
 
+    def _two_depot_bank(self):
+        statement = (':16R:FIN\n:35B:ISIN DE0000000001\n/DE/EXAMPLE\nExample fund\n'
+                     ':93B::AGGR//UNIT/2,500000\n:19A::HOLD//EUR123,45\n:16S:FIN\n')
+        class TwoDepotBank(Bank):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self.full = SimpleNamespace(iban='DE12123456780000000003', accountnumber='123', subaccount='00', blz='50010517')
+                self.empty = SimpleNamespace(iban='DE12123456780000000004', accountnumber='124', subaccount='00', blz='50010517')
+                self.entries += [self.full, self.empty]
+                self.queried = []
+            def get_information(self):
+                result = super().get_information()
+                result['accounts'] += [{'iban': self.full.iban, 'product_name': 'Direkt-Depot'},
+                                       {'iban': self.empty.iban, 'product_name': 'Direkt-Depot'}]
+                return result
+            def get_depot_statements(self, account):
+                self.queried.append(account.iban)
+                # ING answers an empty depot with 3010 "Kein Depotbestand vorhanden": no segments.
+                return [SimpleNamespace(holdings=statement.encode('ascii'))] if account == self.full else []
+        return TwoDepotBank
+
+    def test_empty_depot_does_not_discard_another_depots_positions(self):
+        result = p._sync({}, context(cfg={'holdings_enabled': 'yes'}), factory=self._two_depot_bank())
+        holdings = result['data']['holdings']
+        self.assertIsNotNone(holdings)
+        self.assertEqual([(h['isin'], h['quantity']) for h in holdings], [('DE0000000001', '2.500000')])
+
+    def test_selected_depot_limits_which_depots_are_read(self):
+        bank_cls = self._two_depot_bank()
+        made = []
+        def factory(**kw):
+            made.append(bank_cls(**kw))
+            return made[-1]
+        result = p._sync({}, context(saved={'account_ibans': 'DE12123456780000000001,DE12123456780000000004'},
+                                     cfg={'holdings_enabled': 'yes'}), factory=factory)
+        self.assertEqual(made[0].queried, ['DE12123456780000000004'])
+        # The only selected depot is empty: holdings stay untouched (None), not archived ([]).
+        self.assertIsNone(result['data']['holdings'])
+
     def test_depot_parser_rejects_incomplete_positions(self):
         account = SimpleNamespace(accountnumber='123', subaccount='00', blz='50010517')
         self.assertEqual(p._parse_depot_statement(':16R:GENL\n:16S:GENL\n', account, 'ab' * 32), [])
