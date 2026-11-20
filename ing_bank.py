@@ -255,7 +255,8 @@ def _settings(params, context):
     secret = context.secrets or {}
     login = _text(secret.get('login'))
     pin = str(secret.get('pin') or '')
-    product_id = _text(config.get('product_id'))
+    # A secret field; connections created while it was a setting keep it in config.
+    product_id = _text(secret.get('product_id') or config.get('product_id'))
     if not login or not pin or not product_id:
         raise NeedsAuth('ING login, PIN and registered FinTS product ID are required')
     days = 85
