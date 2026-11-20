@@ -55,7 +55,8 @@
             "key": "product_id",
             "label": {
               "en": "Registered FinTS product ID"
-            }
+            },
+            "secret": true
           },
           {
             "key": "account_ibans",

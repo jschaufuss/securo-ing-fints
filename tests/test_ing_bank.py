@@ -254,6 +254,29 @@ class TestPlugin(unittest.TestCase):
                 self.assertFalse(isinstance(x, float))
         walk(data)
 
+    def test_product_id_is_a_secret_field(self):
+        manifest = json.loads((Path(__file__).resolve().parents[1] / 'securo-plugin.json').read_text())
+        fields = {f['key']: f for f in manifest['contributes']['integrations'][0]['fields']}
+        self.assertTrue(fields['product_id'].get('secret'))
+
+    def test_product_id_is_read_from_secrets(self):
+        made = []
+        def factory(**kw):
+            made.append(kw)
+            return Bank(**kw)
+        ctx = SimpleNamespace(secrets={'login': 'test-login', 'pin': '12345', 'product_id': 'registered-secret-id'},
+                              config={})
+        p._sync({}, ctx, factory=factory, today=date(2026, 11, 18))
+        self.assertEqual(made[0]['product_id'], 'registered-secret-id')
+
+    def test_product_id_still_read_from_config_of_existing_connections(self):
+        made = []
+        def factory(**kw):
+            made.append(kw)
+            return Bank(**kw)
+        p._sync({}, context(), factory=factory, today=date(2026, 11, 18))
+        self.assertEqual(made[0]['product_id'], 'registered-test-id')
+
     def test_manifest(self):
         manifest = json.loads((Path(__file__).resolve().parents[1] / 'securo-plugin.json').read_text())
         self.assertEqual(manifest['min_securo_version'], '0.20.0')
