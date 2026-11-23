@@ -4,6 +4,14 @@ A read-only bank provider plugin for [Securo](https://github.com/securo-finance/
 
 **This plugin is AI-generated and was developed with AI assistance.** It is an independent, community project and is not affiliated with, endorsed by, or supported by ING or Securo. It has been tested with one live ING connection and is not yet broadly production-verified.
 
+## Approach and alternatives
+
+This plugin aims to represent the data ING returns over FinTS as directly as Securo's bank-provider contract allows. It uses ING-provided text for payees and descriptions without merchant-specific cleanup or renaming. It does normalize whitespace, limit field lengths, select among available fields and generate salted IDs, so the displayed data is not a byte-for-byte copy of the bank's response. Securo's own settings and rules can also affect what is displayed.
+
+The plugin does not apply its own heuristic to pair pending entries with booked transactions. Securo may still match them during synchronization, and that matching can fail when ING changes the date or description; see the pending limitation below.
+
+For a different approach, [Marceltov's ING FinTS plugin](https://github.com/Marceltov/securo-ing-fints) offers formatted merchant names and transaction descriptions, and attempts to match pending entries to booked transactions. Its matching uses transaction details rather than a verified shared bank reference, and its pending cleanup has specific Securo configuration requirements; consult its documentation for the trade-offs and setup.
+
 ## Before you start
 
 - Securo **0.20.0 or later**, with plugins enabled and the code plugin runner and egress proxy configured. An administrator must enable these services; see the [Securo bank provider guide](https://github.com/securo-finance/securo/blob/v0.20.0/docs/plugins/bank-provider-plugins.md).
