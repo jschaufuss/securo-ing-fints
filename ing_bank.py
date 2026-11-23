@@ -390,6 +390,7 @@ def _sync(params, context, *, factory=None, today=None) -> dict:
                     'currency': currency,
                     'institution_name': 'ING Deutschland',
                     'institution_external_id': 'ing-de',
+                    'institution_logo': 'bank',
                     'masked_number': iban[-4:],
                     'transactions': rows,
                 })

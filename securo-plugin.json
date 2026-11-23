@@ -17,6 +17,9 @@
     "entrypoint": "ing_bank:plugin",
     "lockfile": "requirements.txt"
   },
+  "logos": {
+    "bank": "bank-logo-256.png"
+  },
   "network": [
     {
       "host": "fints.ing.de",
