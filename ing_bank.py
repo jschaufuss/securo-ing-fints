@@ -195,7 +195,7 @@ def _parse_depot_statement(body, account, salt):
                         getattr(account, 'accountnumber', ''), getattr(account, 'subaccount', ''))
     results = []
     for section in sections:
-        isin = name = currency = quantity = total = None
+        isin = name = currency = quantity = total = unit_price = price_currency = None
         for index, line in enumerate(section):
             match = re.fullmatch(r':35B:ISIN\s+([A-Z]{2}[A-Z0-9]{9}[0-9])(?:\s+(.*))?', line)
             if match:
@@ -216,15 +216,22 @@ def _parse_depot_statement(body, account, salt):
             if match:
                 currency = match.group(1)
                 total = Decimal(match.group(2) + '.' + (match.group(3) or '0'))
+            match = re.fullmatch(r':90B::MRKT//ACTU/([A-Z]{3})(\d+),(\d*)', line)
+            if match:
+                price_currency = match.group(1)
+                unit_price = Decimal(match.group(2) + '.' + (match.group(3) or '0'))
         if not isin or not name or quantity is None or total is None or currency is None:
             raise BankSyncError('ING depot statement is incomplete; holdings were not imported')
         if quantity.as_tuple().exponent < -6 or total.as_tuple().exponent < -6:
             raise BankSyncError('ING depot precision exceeds Securo limits; holdings were not imported')
-        results.append({'external_id': _digest(salt, 'hold-', depot_key, isin), 'name': name,
+        row = {'external_id': _digest(salt, 'hold-', depot_key, isin), 'name': name,
                         'type': 'investment', 'currency': currency,
                         'quantity': format(quantity, 'f'), 'current_value': format(total, 'f'),
                         'isin': isin, 'account_external_id': depot_key,
-                        'account_name': 'ING Direct Depot', 'trades': None})
+                        'account_name': 'ING Direct Depot', 'trades': None}
+        if unit_price is not None and price_currency == currency:
+            row['unit_price'] = format(unit_price, 'f')
+        results.append(row)
     return results
 
 
@@ -241,9 +248,15 @@ def _holdings_rows(bank, entries, metadata, salt):
             return None
         rows = []
         for segment in segments:
-            rows.extend(_parse_depot_statement(getattr(segment, 'holdings', None), account, salt))
-        if not rows:
-            return None
+            body = getattr(segment, 'holdings', None)
+            if isinstance(body, bytes):
+                body = body.decode('iso-8859-1')
+            lines = [line.strip() for line in body.splitlines() if line.strip()] if isinstance(body, str) else []
+            markers = (':16R:GENL', ':16S:GENL', ':16R:ADDINFO', ':16S:ADDINFO')
+            if not (lines and lines[-1] == '-' and all(lines.count(m) == 1 for m in markers) and
+                    [lines.index(m) for m in markers] == sorted(lines.index(m) for m in markers)):
+                raise BankSyncError('ING returned an incomplete depot statement; holdings were not changed')
+            rows.extend(_parse_depot_statement(body, account, salt))
         results.extend(rows)
     if len(results) > 5000 or len({row['external_id'] for row in results}) != len(results):
         raise BankSyncError('ING depot positions are duplicated or exceed Securo limits')

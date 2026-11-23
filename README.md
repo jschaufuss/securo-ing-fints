@@ -48,7 +48,7 @@ As a temporary workaround, disable **Import pending transactions** and use balan
 
 ## Limitations and privacy
 
-- ING supports Direct Depot data via FinTS. Depot discovery and an empty depot response have been tested, but importing live holdings is **experimental and not yet verified with actual positions**. The plugin reads complete MT535 positions and leaves existing holdings unchanged when a depot reports no positions; missing or incomplete data stops the sync rather than deleting assets. Compare imported positions and valuations with ING.
+- ING supports Direct Depot data via FinTS. Importing a live position has been observed; depot support remains **experimental**. Depots are read separately and a valid empty depot does not block positions from other depots. The plugin requires a complete MT535 envelope; missing or incomplete answers do not replace holdings. Securo may archive positions that disappear from a complete holdings response. Unit prices are included only when supported fields with matching currency are available. Purchase costs are not imported because their interpretation has not been verified; tickers are not inferred from ISINs. Compare positions and valuations with ING.
 - ING does not list Rahmenkredit as a supported FinTS account in its current [FinTS FAQ](https://www.ing.de/hilfe/log-in/fints/). This plugin does not implement or verify Rahmenkredit support.
 - Interactive TAN or app approval is not implemented. If ING requires a challenge that cannot be completed by this read-only flow, the connection pauses and needs attention.
 - The bank's FinTS balance can differ from the balance shown in ING's app, including because of pending items. Do not assume either balance mode matches the app in every situation.
