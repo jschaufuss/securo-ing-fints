@@ -191,8 +191,8 @@ class TestPlugin(unittest.TestCase):
         self.assertIsNone(result['data']['holdings'])
 
     def test_depot_is_read_independently_of_selected_cash_accounts(self):
-        statement = (':16R:FIN\n:35B:ISIN DE0000000001\n/DE/EXAMPLE\nExample fund\n'
-                     ':93B::AGGR//UNIT/2,500000\n:19A::HOLD//EUR123,45\n:16S:FIN\n')
+        statement = (':16R:GENL\n:16S:GENL\n:16R:FIN\n:35B:ISIN DE0000000001\n/DE/EXAMPLE\nExample fund\n'
+                     ':93B::AGGR//UNIT/2,500000\n:19A::HOLD//EUR123,45\n:16S:FIN\n:16R:ADDINFO\n:16S:ADDINFO\n-')
         class DepotBank(Bank):
             def __init__(self, **kw):
                 super().__init__(**kw)
@@ -222,6 +222,46 @@ class TestPlugin(unittest.TestCase):
         self.assertEqual(p._parse_depot_statement(':16R:GENL\n:16S:GENL\n', account, 'ab' * 32), [])
         with self.assertRaises(p.BankSyncError):
             p._parse_depot_statement(':16R:FIN\n:35B:ISIN DE0000000001\n:16S:FIN\n', account, 'ab' * 32)
+
+    def test_empty_depot_does_not_block_other_depots(self):
+        first = SimpleNamespace(iban='DE12123456780000000003', accountnumber='123', subaccount='00', blz='50010517')
+        second = SimpleNamespace(iban='DE12123456780000000004', accountnumber='456', subaccount='00', blz='50010517')
+        meta = {a.iban: {'product_name': 'Direct Depot'} for a in (first, second)}
+        empty = ':16R:GENL\n:16S:GENL\n:16R:ADDINFO\n:16S:ADDINFO\n-'
+        full = (':16R:GENL\n:16S:GENL\n:16R:FIN\n:35B:ISIN DE0000000001\nExample fund\n'
+                ':93B::AGGR//UNIT/2,5\n:19A::HOLD//EUR123,45\n:16S:FIN\n:16R:ADDINFO\n:16S:ADDINFO\n-')
+        class DepotBank:
+            def get_depot_statements(self, account):
+                return [SimpleNamespace(holdings=empty if account == first else full)]
+        rows = p._holdings_rows(DepotBank(), [first, second], meta, 'ab' * 32)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['name'], 'Example fund')
+        self.assertEqual(p._holdings_rows(DepotBank(), [first], meta, 'ab' * 32), [])
+
+    def test_unknown_empty_depot_response_fails_closed(self):
+        account = SimpleNamespace(iban='DE12123456780000000003', accountnumber='123', subaccount='00', blz='50010517')
+        meta = {account.iban: {'product_name': 'Direct Depot'}}
+        for body in ('', ':16R:GENL\n:16S:GENL', ':16R:GENL\n:16S:GENL\n:16R:ADDINFO\n-',
+                     ':16R:GENL\n:16S:GENL\n:16R:FIN\n:35B:ISIN DE0000000001\nName\n:93B::AGGR//UNIT/1,\n:19A::HOLD//EUR1,\n:16S:FIN'):
+            class DepotBank:
+                def get_depot_statements(self, account): return [SimpleNamespace(holdings=body)]
+            with self.subTest(body=body), self.assertRaises(p.BankSyncError):
+                p._holdings_rows(DepotBank(), [account], meta, 'ab' * 32)
+
+    def test_depot_optional_price_and_cost_basis(self):
+        account = SimpleNamespace(accountnumber='123', subaccount='00', blz='50010517')
+        statement = (':16R:FIN\n:35B:ISIN DE0000000001\nExample fund\n'
+                     ':90B::MRKT//ACTU/EUR140,25\n:93B::AGGR//UNIT/2,5\n'
+                     ':19A::HOLD//EUR350,63\n:70E::HOLD//1STK\n120,123456+EUR\n:16S:FIN')
+        row = p._parse_depot_statement(statement, account, 'ab' * 32)[0]
+        self.assertEqual(row['unit_price'], '140.25')
+        # HOLD free text has not been verified as a cost basis and must never
+        # overwrite a user's purchase price with an inferred amount.
+        self.assertNotIn('purchase_price', row)
+        self.assertNotIn('ticker', row)
+        other_currency = p._parse_depot_statement(statement.replace('+EUR', '+USD').replace('ACTU/EUR', 'ACTU/USD'), account, 'ab' * 32)[0]
+        self.assertNotIn('unit_price', other_currency)
+        self.assertNotIn('purchase_price', other_currency)
 
     def test_bad_history(self):
         with self.assertRaises(p.BankSyncError):
