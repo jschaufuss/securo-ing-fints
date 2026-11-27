@@ -8,137 +8,22 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import hashlib
-import hmac
-import re
 import secrets as pysecrets
-from collections import Counter
-from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
+
+from ing_common import BankSyncError, NeedsAuth, RateLimited, _account_type, _as_iso_day, _digest, _money, _require_result, _text
+from ing_transactions import MAX_TX, _transaction_rows
+from ing_depot import _holdings_rows, _parse_depot_statement
 
 ING_BANK_CODE = '50010517'
 ING_SERVER = 'https://fints.ing.de/fints/'
 CONTRACT = 1
-MAX_TX = 20_000
-
-
-class NeedsAuth(Exception):
-    """Securo should pause polling until credentials / approval are refreshed."""
-
-
-class RateLimited(Exception):
-    """Securo should retry on its next scheduled interval."""
-
-
-class BankSyncError(Exception):
-    """Bank or data-format failure with a non-sensitive message."""
-
-
-def _text(value, size=500) -> str:
-    if isinstance(value, (list, tuple)):
-        value = ' '.join(_text(item, size) for item in value if item is not None)
-    elif isinstance(value, bytes):
-        value = value.decode('utf-8', errors='replace')
-    return ' '.join(str(value or '').split())[:size]
-
-
-def _money(value) -> Decimal:
-    if hasattr(value, 'amount'):
-        value = value.amount
-    try:
-        v = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise BankSyncError('ING returned an unreadable amount; nothing was imported') from None
-    if not v.is_finite():
-        raise BankSyncError('ING returned an invalid amount; nothing was imported')
-    return v
-
-
-def _as_iso_day(value) -> str:
-    if isinstance(value, dt.datetime):
-        return value.date().isoformat()
-    if isinstance(value, dt.date):
-        return value.isoformat()
-    if isinstance(value, str):
-        try:
-            return dt.date.fromisoformat(value[:10]).isoformat()
-        except ValueError:
-            pass
-    raise BankSyncError('ING booking has no valid posting date; nothing was imported')
-
-
-def _digest(salt: str, prefix: str, *values) -> str:
-    # HMAC prevents revealing the IBAN and preserves IDs across syncs.
-    content = '\x1f'.join(str(value) for value in values).encode('utf-8')
-    return prefix + hmac.new(bytes.fromhex(salt), content, hashlib.sha256).hexdigest()[:40]
-
-
-def _transaction_rows(items, salt: str, account_id: str, *, status='posted') -> list[dict]:
-    """Normalize mt940 and fints.models.Transaction rows to Securo contract 1.
-
-    Truly identical rows without a bank transaction ID can only be identified by
-    their occurrence number; reordering identical bank records is impossible to
-    disambiguate without an actual bank-assigned immutable ID.
-    """
-    prepared = []
-    for item in items:
-        raw = getattr(item, 'data', None)
-        if not isinstance(raw, dict):
-            raise BankSyncError('ING returned an unknown transaction format; nothing was imported')
-        date = _as_iso_day(raw.get('entry_date') or raw.get('booking_date') or raw.get('bookingDate') or raw.get('date'))
-        amount = _money(raw.get('amount'))
-        desc = _text(raw.get('purpose') or raw.get('transaction_details') or
-                     raw.get('remittance_information') or raw.get('applicant_name') or
-                     raw.get('extra_details') or 'ING transaction', 500)
-        payee = _text(raw.get('applicant_name') or raw.get('recipient_name') or raw.get('counterparty_name'), 200)
-        references = [_text(raw.get(k), 100) for k in (
-            'transaction_id', 'bank_reference', 'end_to_end_reference', 'customer_reference', 'id')]
-        references = [r for r in references if r.upper() not in ('', 'NOTPROVIDED', 'NONREF', 'NONE')]
-        # The fingerprint includes the business fields even when a reference is present.
-        fingerprint = (account_id, date, str(amount), desc, payee, *references)
-        prepared.append((fingerprint, {
-            'description': desc,
-            'amount': format(abs(amount), 'f'),
-            'date': date,
-            'type': 'credit' if amount >= 0 else 'debit',
-            'currency': _text(getattr(raw.get('amount'), 'currency', None) or raw.get('currency') or 'EUR', 3).upper(),
-            'status': status,
-            **({'payee': payee} if payee else {}),
-        }))
-    occurrence = Counter()
-    rows = []
-    # Sorting by content makes duplicate occurrence IDs independent of API order.
-    for fingerprint, row in sorted(prepared, key=lambda pair: pair[0]):
-        n = occurrence[fingerprint]
-        occurrence[fingerprint] += 1
-        row['external_id'] = _digest(salt, 'tx-' if status == 'posted' else 'pending-', *fingerprint, n)
-        rows.append(row)
-    if len(rows) > MAX_TX:
-        raise BankSyncError('Too many ING transactions for one Securo synchronization; shorten history window')
-    return rows
-
-
-def _account_type(product: str) -> str:
-    p = product.casefold()
-    if any(word in p for word in ('extra-konto', 'extrakonto', 'tagesgeld', 'spar', 'savings')):
-        return 'savings'
-    if any(word in p for word in ('depot', 'investment', 'wertpapier')):
-        return 'investment'
-    return 'checking'
 
 
 def _get_bank_info(bank) -> dict:
     value = bank.get_information() or {}
     return {str(a.get('iban', '')).replace(' ', ''): a
             for a in value.get('accounts', []) if isinstance(a, dict) and a.get('iban')}
-
-
-def _require_result(value, *, stage: str):
-    # Do not save a pending challenge as a successful sync; never initiate payments.
-    if value is None:
-        raise BankSyncError(f'ING returned no {stage}; nothing was imported')
-    if value.__class__.__name__ in ('NeedTANResponse', 'NeedRetryResponse'):
-        raise NeedsAuth('ING requires approval in the banking app; automated FinTS sync is paused')
-    return value
 
 
 def _balance_codes(response):
@@ -163,104 +48,6 @@ def _balance_reason(response):
             if 'auftragsart' in message and 'konto' in message and 'nicht möglich' in message:
                 return 'unsupported-account'
     return 'unclassified'
-
-
-def _parse_depot_statement(body, account, salt):
-    """Read complete MT535 positions without logging or approximating bank values."""
-    if isinstance(body, bytes):
-        body = body.decode('iso-8859-1')
-    if not isinstance(body, str):
-        raise BankSyncError('Unsupported ING depot statement')
-    lines = body.splitlines()
-    sections = []
-    current = None
-    for line in lines:
-        line = line.strip()
-        if line == ':16R:FIN':
-            if current is not None:
-                raise BankSyncError('Incomplete ING depot statement')
-            current = []
-        elif line == ':16S:FIN':
-            if current is None:
-                raise BankSyncError('Incomplete ING depot statement')
-            sections.append(current)
-            current = None
-        elif current is not None:
-            current.append(line)
-    if current is not None:
-        raise BankSyncError('Incomplete ING depot statement')
-    if not sections:
-        return []
-    depot_key = _digest(salt, 'depot-', getattr(account, 'blz', ''),
-                        getattr(account, 'accountnumber', ''), getattr(account, 'subaccount', ''))
-    results = []
-    for section in sections:
-        isin = name = currency = quantity = total = unit_price = price_currency = None
-        for index, line in enumerate(section):
-            match = re.fullmatch(r':35B:ISIN\s+([A-Z]{2}[A-Z0-9]{9}[0-9])(?:\s+(.*))?', line)
-            if match:
-                isin = match.group(1)
-                parts = []
-                if match.group(2):
-                    parts.append(match.group(2))
-                for follow in section[index + 1:]:
-                    if follow.startswith(':') or follow.startswith('-'):
-                        break
-                    if follow and not follow.startswith('/DE/'):
-                        parts.append(follow)
-                name = _text(parts[-1] if parts else '', 255)
-            match = re.fullmatch(r':93B::AGGR//UNIT/(\d+),(\d*)', line)
-            if match:
-                quantity = Decimal(match.group(1) + '.' + (match.group(2) or '0'))
-            match = re.fullmatch(r':19A::HOLD//([A-Z]{3})(\d+),(\d*)', line)
-            if match:
-                currency = match.group(1)
-                total = Decimal(match.group(2) + '.' + (match.group(3) or '0'))
-            match = re.fullmatch(r':90B::MRKT//ACTU/([A-Z]{3})(\d+),(\d*)', line)
-            if match:
-                price_currency = match.group(1)
-                unit_price = Decimal(match.group(2) + '.' + (match.group(3) or '0'))
-        if not isin or not name or quantity is None or total is None or currency is None:
-            raise BankSyncError('ING depot statement is incomplete; holdings were not imported')
-        if quantity.as_tuple().exponent < -6 or total.as_tuple().exponent < -6:
-            raise BankSyncError('ING depot precision exceeds Securo limits; holdings were not imported')
-        row = {'external_id': _digest(salt, 'hold-', depot_key, isin), 'name': name,
-                        'type': 'investment', 'currency': currency,
-                        'quantity': format(quantity, 'f'), 'current_value': format(total, 'f'),
-                        'isin': isin, 'account_external_id': depot_key,
-                        'account_name': 'ING Direct Depot', 'trades': None}
-        if unit_price is not None and price_currency == currency:
-            row['unit_price'] = format(unit_price, 'f')
-        results.append(row)
-    return results
-
-
-def _holdings_rows(bank, entries, metadata, salt):
-    """Read every discovered depot completely; never archive on an uncertain response."""
-    candidates = [a for a in entries if _account_type(_text(metadata.get(
-        _text(getattr(a, 'iban', '')).replace(' ', '').upper(), {}).get('product_name'))) == 'investment']
-    if not candidates:
-        return None
-    results = []
-    for account in candidates:
-        segments = _require_result(bank.get_depot_statements(account), stage='depot holdings')
-        if not segments:
-            return None
-        rows = []
-        for segment in segments:
-            body = getattr(segment, 'holdings', None)
-            if isinstance(body, bytes):
-                body = body.decode('iso-8859-1')
-            lines = [line.strip() for line in body.splitlines() if line.strip()] if isinstance(body, str) else []
-            markers = (':16R:GENL', ':16S:GENL', ':16R:ADDINFO', ':16S:ADDINFO')
-            if not (lines and lines[-1] == '-' and all(lines.count(m) == 1 for m in markers) and
-                    [lines.index(m) for m in markers] == sorted(lines.index(m) for m in markers)):
-                raise BankSyncError('ING returned an incomplete depot statement; holdings were not changed')
-            rows.extend(_parse_depot_statement(body, account, salt))
-        results.extend(rows)
-    if len(results) > 5000 or len({row['external_id'] for row in results}) != len(results):
-        raise BankSyncError('ING depot positions are duplicated or exceed Securo limits')
-    return results
 
 
 def _settings(params, context):
@@ -356,17 +143,23 @@ def _sync(params, context, *, factory=None, today=None) -> dict:
                 listed = [acc for acc in listed if str(getattr(acc, 'iban', '') or '').replace(' ', '').upper() in selected]
             metadata = _get_bank_info(bank)
             accounts = []
+            seen_account_ids = set()
             for acc in listed:
                 iban = _text(getattr(acc, 'iban', '')).replace(' ', '').upper()
                 if not iban:
                     raise BankSyncError('An ING account has no stable IBAN; nothing was imported')
                 acc_id = _digest(salt, 'ing-', iban)
+                if acc_id in seen_account_ids:
+                    raise BankSyncError('ING returned the same account more than once; nothing was imported')
+                seen_account_ids.add(acc_id)
                 product = _text(metadata.get(iban, {}).get('product_name') or 'ING account', 180)
                 if _account_type(product) == 'investment':
                     continue
                 currency = _text(metadata.get(iban, {}).get('currency') or 'EUR', 3).upper()
                 if len(currency) != 3 or not currency.isalpha():
                     raise BankSyncError('Unexpected account currency; nothing was imported')
+                # Never reuse the preceding account's pending balance.
+                bank._pending_balance = None
                 balance_obj = _require_result(bank.get_balance(acc), stage='account balance')
                 if balance_mode == 'pending' and _account_type(product) == 'checking':
                     pending_balance = getattr(bank, '_pending_balance', None)
