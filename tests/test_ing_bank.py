@@ -104,6 +104,7 @@ class TestPlugin(unittest.TestCase):
         self.assertEqual({x['type'] for x in result['data']['accounts']}, {'checking', 'savings'})
         self.assertIsNone(result['data']['holdings'])
         self.assertEqual(result['data']['accounts'][0]['masked_number'], '0001')
+        self.assertEqual(result['data']['accounts'][0]['institution_logo'], 'bank')
         self.assertEqual(result['data']['accounts'][0]['balance'], '2300.34')
         self.assertEqual(result['data']['accounts'][0]['transactions'][0]['type'], 'debit')
         self.assertEqual(result['data']['accounts'][0]['transactions'][0]['amount'], '34.78')
@@ -143,6 +144,21 @@ class TestPlugin(unittest.TestCase):
         self.assertEqual(result['data']['accounts'][0]['balance'], '2.43')
         self.assertEqual(result['data']['accounts'][1]['balance'], '4100.32')
 
+    def test_pending_balance_cannot_leak_from_another_account(self):
+        class TwoChecking(Bank):
+            def get_information(self):
+                info = super().get_information()
+                info['accounts'][1]['product_name'] = 'ING Girokonto'
+                return info
+            def get_balance(self, entry):
+                if entry == self.entries[0]:
+                    self._pending_balance = SimpleNamespace(
+                        amount=Decimal('2.43'),
+                        as_mt940_Balance=lambda: SimpleNamespace(amount=Amount('2.43')))
+                return super().get_balance(entry)
+        with self.assertRaisesRegex(p.BankSyncError, 'did not provide a pending balance'):
+            p._sync({}, context(cfg={'balance_mode': 'pending'}), factory=TwoChecking)
+
     def test_booking_date_before_value_date(self):
         row = SimpleNamespace(data={
             'date': date(2026, 11, 15), 'entry_date': date(2026, 11, 17),
@@ -171,6 +187,13 @@ class TestPlugin(unittest.TestCase):
             def get_sepa_accounts(self): return []
         with self.assertRaises(p.BankSyncError):
             p._sync({}, context(), factory=Empty, today=date(2026, 11, 18))
+
+    def test_duplicate_accounts_fail_before_sync(self):
+        class Duplicate(Bank):
+            def get_sepa_accounts(self):
+                return [self.entries[0], self.entries[0]]
+        with self.assertRaisesRegex(p.BankSyncError, 'same account more than once'):
+            p._sync({}, context(), factory=Duplicate, today=date(2026, 11, 18))
 
     def test_tan_pauses_sync(self):
         class Challenge(Bank):
@@ -255,13 +278,61 @@ class TestPlugin(unittest.TestCase):
                      ':19A::HOLD//EUR350,63\n:70E::HOLD//1STK\n120,123456+EUR\n:16S:FIN')
         row = p._parse_depot_statement(statement, account, 'ab' * 32)[0]
         self.assertEqual(row['unit_price'], '140.25')
-        # HOLD free text has not been verified as a cost basis and must never
-        # overwrite a user's purchase price with an inferred amount.
+        # Without a structured line 2 the field is not a verified cost basis.
         self.assertNotIn('purchase_price', row)
         self.assertNotIn('ticker', row)
         other_currency = p._parse_depot_statement(statement.replace('+EUR', '+USD').replace('ACTU/EUR', 'ACTU/USD'), account, 'ab' * 32)[0]
-        self.assertNotIn('unit_price', other_currency)
+        self.assertEqual(other_currency['unit_price'], '140.252000')
         self.assertNotIn('purchase_price', other_currency)
+
+    def test_depot_structured_cost_basis(self):
+        account = SimpleNamespace(accountnumber='123', subaccount='00', blz='50010517')
+        template = (':16R:FIN\n:35B:ISIN DE0000000001\nExample\n'
+                    ':93B::AGGR//UNIT/{qty}\n:19A::HOLD//EUR200,\n'
+                    ':70E::HOLD//{body}\n:16S:FIN')
+        for qty, body, expected in [
+            ('1,', '1STK\n2271,62+EUR', '271.62'),
+            ('1,', '1STK\n242,75+EUR', '42.75'),
+            ('2,5', '1STK+511+00081+DE+20200101\n2120,123456+EUR', '300.31'),
+            ('1,', '1STK\n3C+202001\n2271,62+EUR\n4DE0000000001', '271.62'),
+        ]:
+            with self.subTest(body=body):
+                row = p._parse_depot_statement(template.format(qty=qty, body=body), account, 'ab' * 32)[0]
+                self.assertEqual(row['purchase_price'], expected)
+
+    def test_depot_ambiguous_or_foreign_cost_is_not_imported(self):
+        account = SimpleNamespace(accountnumber='123', subaccount='00', blz='50010517')
+        template = (':16R:FIN\n:35B:ISIN DE0000000001\nExample\n'
+                    ':93B::AGGR//UNIT/1,\n:19A::HOLD//EUR200,\n'
+                    ':70E::HOLD//{body}\n:16S:FIN')
+        for body in ('1STK\n2159,95+USD', '1STK\n2159,95+',
+                     '1STK\n2271,62+EUR\n2271,62+EUR',
+                     '1STK\n2271,62+EUR\n:70E::HOLD//1STK\n2271,62+EUR',
+                     '1EUR\n2271,62+EUR', '2271,62+EUR', '1STK\n20,+EUR'):
+            with self.subTest(body=body):
+                row = p._parse_depot_statement(template.format(body=body), account, 'ab' * 32)[0]
+                self.assertNotIn('purchase_price', row)
+
+    def test_depot_derived_unit_price_and_zero_quantity(self):
+        account = SimpleNamespace(accountnumber='123', subaccount='00', blz='50010517')
+        statement = (':16R:FIN\n:35B:ISIN DE0000000001\nExample fund\n'
+                     ':93B::AGGR//UNIT/3,\n:19A::HOLD//EUR100,\n:16S:FIN')
+        row = p._parse_depot_statement(statement, account, 'ab' * 32)[0]
+        self.assertEqual(row['unit_price'], '33.333333')
+        self.assertNotIn('purchase_price', row)
+        zero = p._parse_depot_statement(statement.replace('UNIT/3,', 'UNIT/0,'), account, 'ab' * 32)[0]
+        self.assertNotIn('unit_price', zero)
+
+    def test_depot_rejects_position_outside_holdings_section(self):
+        account = SimpleNamespace(iban='DE12123456780000000003', accountnumber='123', subaccount='00', blz='50010517')
+        meta = {account.iban: {'product_name': 'Direct Depot'}}
+        statement = (':16R:GENL\n:16S:GENL\n:16R:ADDINFO\n:16R:FIN\n'
+                     ':35B:ISIN DE0000000001\nExample\n:93B::AGGR//UNIT/1,\n'
+                     ':19A::HOLD//EUR1,\n:16S:FIN\n:16S:ADDINFO\n-')
+        class DepotBank:
+            def get_depot_statements(self, account): return [SimpleNamespace(holdings=statement)]
+        with self.assertRaisesRegex(p.BankSyncError, 'invalid depot statement'):
+            p._holdings_rows(DepotBank(), [account], meta, 'ab' * 32)
 
     def test_bad_history(self):
         with self.assertRaises(p.BankSyncError):
@@ -299,6 +370,9 @@ class TestPlugin(unittest.TestCase):
         self.assertEqual(manifest['min_securo_version'], '0.20.0')
         self.assertEqual(manifest['runtime']['entrypoint'], 'ing_bank:plugin')
         self.assertEqual(manifest['network'][0]['host'], 'fints.ing.de')
+        logo = Path(__file__).resolve().parents[1] / manifest['logos']['bank']
+        self.assertTrue(logo.read_bytes().startswith(b'\x89PNG\r\n\x1a\n'))
+        self.assertLessEqual(logo.stat().st_size, 256 * 1024)
         self.assertEqual(manifest['contributes']['integrations'][0]['provides'], ['accounts','transactions','holdings'])
         self.assertTrue(re.match(r'^[a-z0-9-]+/[a-z0-9-]+$', manifest['id']))
 
